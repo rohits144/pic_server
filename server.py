@@ -34,7 +34,7 @@ except ImportError:
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tiff"}
 EXIF_DT_TAGS = (piexif.ExifIFD.DateTimeOriginal, piexif.ExifIFD.DateTimeDigitized)
 EXIF_DT_FORMAT = "%Y:%m:%d %H:%M:%S"
-THUMBNAIL_SIZE = (300, 300)  # max thumbnail dimensions sent to browser
+THUMBNAIL_SIZE = (600, 600)  # max thumbnail dimensions sent to browser (increased for better preview)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,22 @@ def make_thumbnail_b64(image_path):
         return None
 
 
+def make_image_b64(image_path):
+    """
+    Returns the original image file (no resize) as a base64 data-URI string.
+    Returns None if the image cannot be opened.
+    """
+    try:
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f"data:{mime_type};base64,{b64}"
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Step 6 — HTTP request handler
 # ---------------------------------------------------------------------------
@@ -242,6 +258,22 @@ class Handler(BaseHTTPRequestHandler):
             b64 = make_thumbnail_b64(image_path)
             if b64:
                 self.send_json({"thumbnail": b64})
+            else:
+                self.send_json({"error": "could not open image"}, 500)
+
+        elif path == "/api/image":
+            # Returns the original image as base64 (for magnified view)
+            image_path = params.get("path", [None])[0]
+            if not image_path or not os.path.isfile(image_path):
+                self.send_json({"error": "file not found"}, 404)
+                return
+            # Security: only serve files inside the configured folder
+            if not image_path.startswith(self.server.folder):
+                self.send_json({"error": "access denied"}, 403)
+                return
+            b64 = make_image_b64(image_path)
+            if b64:
+                self.send_json({"image": b64})
             else:
                 self.send_json({"error": "could not open image"}, 500)
 
@@ -327,14 +359,22 @@ HTML_PAGE = """<!DOCTYPE html>
   .group-meta { font-size: 12px; color: #666; }
   .group-body { display: none; padding: 12px 16px; border-top: 1px solid #eee; }
   .group-body.open { display: block; }
-  .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
   .photo-card { border: 1px solid #ddd; border-radius: 8px; overflow: hidden;
-                transition: opacity 0.2s; background: #fff; }
+                transition: opacity 0.2s, transform 0.15s; background: #fff; }
+  .photo-card:hover { transform: translateY(-4px); }
   .photo-card.deleted { opacity: 0.35; }
   .thumb { width: 100%; aspect-ratio: 4/3; background: #eee; display: flex;
-           align-items: center; justify-content: center; overflow: hidden; }
+           align-items: center; justify-content: center; overflow: hidden; cursor: zoom-in; }
   .thumb img { width: 100%; height: 100%; object-fit: cover; }
   .thumb .icon { font-size: 32px; color: #bbb; }
+  /* Modal (magnifier) */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none;
+                   align-items: center; justify-content: center; z-index: 9999; padding: 20px; }
+  .modal-overlay.open { display: flex; }
+  .modal-img { max-width: 95%; max-height: 95%; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); }
+  .modal-close { position: absolute; top: 18px; right: 22px; background: rgba(255,255,255,0.9); border-radius: 999px;
+                 padding: 6px 10px; cursor: pointer; font-weight: 700; }
   .photo-info { padding: 8px 10px; }
   .photo-name { font-size: 12px; font-weight: 500; white-space: nowrap;
                 overflow: hidden; text-overflow: ellipsis; }
@@ -384,6 +424,12 @@ HTML_PAGE = """<!DOCTYPE html>
   <button class="btn-action btn-primary" id="btn-delete" onclick="confirmDelete()">
     Move selected to trash folder
   </button>
+</div>
+
+<!-- Modal for magnified image -->
+<div id="modal" class="modal-overlay" onclick="closeModal(event)">
+  <div class="modal-close" onclick="closeModal(event)">✕</div>
+  <img id="modal-img" class="modal-img" src="" alt=""/>
 </div>
 
 <script>
@@ -454,7 +500,7 @@ function photoCard(p) {
   const isKept = state.kept[p.path];
   return `
     <div class="photo-card ${isDel?'deleted':''}" id="card-${path64}">
-      <div class="thumb">
+      <div class="thumb" onclick="showImage('${p.path.replace(/'/g, "\\'")}')">
         <img id="thumb-${path64}" src="" alt="" style="display:none"
              onload="this.style.display='block';this.previousSibling.style.display='none'">
         <div class="icon">&#128247;</div>
@@ -466,10 +512,10 @@ function photoCard(p) {
         <span class="${srcClass}">${srcLabel}</span>
       </div>
       <div class="photo-actions">
-        <button class="btn-keep ${isKept?'active':''}" onclick="markKeep('${p.path}')">
+        <button class="btn-keep ${isKept?'active':''}" onclick="markKeep('${p.path.replace(/'/g, "\\'")}')">
           ${isKept ? '✓ Keeping' : 'Keep'}
         </button>
-        <button class="btn-del ${isDel?'active':''}" onclick="markDelete('${p.path}')">
+        <button class="btn-del ${isDel?'active':''}" onclick="markDelete('${p.path.replace(/'/g, "\\'")}')">
           ${isDel ? '✕ Delete' : 'Delete'}
         </button>
       </div>
@@ -488,6 +534,34 @@ async function loadThumbnails(photos) {
       if (data.thumbnail) img.src = data.thumbnail;
     } catch (e) { /* silent */ }
   }
+}
+
+// --- Show full-size image in modal ---
+async function showImage(path) {
+  const modal = document.getElementById('modal');
+  const modalImg = document.getElementById('modal-img');
+  modal.classList.add('open');
+  modalImg.src = ''; // clear while loading
+  try {
+    const res = await fetch('/api/image?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    if (data.image) {
+      modalImg.src = data.image;
+    } else {
+      modalImg.alt = 'Could not load image';
+    }
+  } catch (e) {
+    modalImg.alt = 'Error loading image';
+  }
+}
+
+function closeModal(e) {
+  // prevent propagation from close button to overlay double-run
+  if (e) e.stopPropagation && e.stopPropagation();
+  const modal = document.getElementById('modal');
+  const modalImg = document.getElementById('modal-img');
+  modal.classList.remove('open');
+  modalImg.src = '';
 }
 
 // --- Toggle group open/closed ---
